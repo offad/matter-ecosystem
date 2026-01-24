@@ -3,7 +3,106 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
 -- Library
-local Matter = require(ReplicatedStorage.Matter) -- Load the Matter ECS library
+local Matter = require(ReplicatedStorage.Matter) -- Load the Matter ECS library open-source library
+
+-- Vec2 Class (Metatable implementation for 2D vector math)
+-- This class handles XZ plane operations since our simulation is 2D
+local Vec2 = {}
+Vec2.__index = Vec2 -- set metatable index to itself for method lookup
+
+-- Define Vec2 type for type checking (includes fields and methods)
+export type Vec2 = {
+	x: number,
+	z: number,
+	magnitude: (self: Vec2) -> number,
+	sqrMagnitude: (self: Vec2) -> number,
+	unit: (self: Vec2) -> Vec2,
+	dot: (self: Vec2, other: Vec2) -> number,
+	toVector3: (self: Vec2, y: number?) -> Vector3,
+}
+
+-- Constructor: creates a new Vec2 instance
+function Vec2.new(x: number, z: number)
+	local self = setmetatable({}, Vec2) -- create table and set Vec2 as its metatable
+	self.x = x or 0 -- default to 0 if nil
+	self.z = z or 0
+	return self
+end
+
+-- Create Vec2 from a Vector3 (extracts X and Z, ignores Y)
+function Vec2.fromVector3(v: Vector3)
+	return Vec2.new(v.X, v.Z)
+end
+
+-- Convert Vec2 back to Vector3 (with configurable Y value)
+function Vec2:toVector3(y: number?): Vector3
+	return Vector3.new(self.x, y or 0, self.z)
+end
+
+-- Calculate magnitude (length) of the vector
+function Vec2:magnitude(): number
+	return math.sqrt(self.x * self.x + self.z * self.z)
+end
+
+-- Calculate squared magnitude (avoids sqrt for performance)
+function Vec2:sqrMagnitude(): number
+	return self.x * self.x + self.z * self.z
+end
+
+-- Return normalized (unit) vector with magnitude 1
+function Vec2:unit(): Vec2
+	local mag = self:magnitude()
+	if mag > 0 then
+		return Vec2.new(self.x / mag, self.z / mag)
+	end
+	return Vec2.new(0, 0) -- return zero vector if magnitude is 0
+end
+
+-- Dot product of two Vec2s
+function Vec2:dot(other: Vec2): number
+	return self.x * other.x + self.z * other.z
+end
+
+-- Metamethod: addition operator overload (a + b)
+function Vec2.__add(a: Vec2, b: Vec2): Vec2
+	return Vec2.new(a.x + b.x, a.z + b.z)
+end
+
+-- Metamethod: subtraction operator overload (a - b)
+function Vec2.__sub(a: Vec2, b: Vec2): Vec2
+	return Vec2.new(a.x - b.x, a.z - b.z)
+end
+
+-- Metamethod: multiplication operator overload (a * b or a * number)
+function Vec2.__mul(a: Vec2, b): Vec2
+	if type(b) == "number" then
+		return Vec2.new(a.x * b, a.z * b) -- scalar multiplication
+	end
+	return Vec2.new(a.x * b.x, a.z * b.z) -- component-wise multiplication
+end
+
+-- Metamethod: division operator overload (a / b or a / number)
+function Vec2.__div(a: Vec2, b): Vec2
+	if type(b) == "number" then
+		return Vec2.new(a.x / b, a.z / b) -- scalar division
+	end
+	return Vec2.new(a.x / b.x, a.z / b.z) -- component-wise division
+end
+
+-- Metamethod: unary minus operator overload (-a)
+function Vec2.__unm(a: Vec2): Vec2
+	return Vec2.new(-a.x, -a.z)
+end
+
+-- Metamethod: equality operator overload (a == b)
+function Vec2.__eq(a: Vec2, b: Vec2): boolean
+	return a.x == b.x and a.z == b.z
+end
+
+-- Metamethod: tostring for debugging
+function Vec2.__tostring(v: Vec2): string
+	return string.format("Vec2(%.2f, %.2f)", v.x, v.z)
+end
 
 -- Constants:
 
@@ -46,12 +145,25 @@ local SEPARATION_FORCE = 120 -- strength of separation force
 local BOUNDS_PADDING = 4 -- how close to edge before applying force
 local BOUNDS_FORCE = 200 -- strength of bounds force
 
+-- CFrame interpolation speed for smooth rotation
+local ROTATION_LERP_SPEED = 0.15 -- how fast entities rotate toward movement direction
+
 -- Variables:
 
 -- Create world container
 local container = Instance.new("Folder")
 container.Name = "World"
 container.Parent = game.Workspace -- put the folder in the Workspace
+
+-- Raycast parameters for line-of-sight checks
+local raycastParams = RaycastParams.new()
+raycastParams.FilterType = Enum.RaycastFilterType.Exclude -- exclude specified instances
+raycastParams.FilterDescendantsInstances = { container } -- ignore all simulation entities
+
+-- Overlap parameters for spatial queries
+local overlapParams = OverlapParams.new()
+overlapParams.FilterType = Enum.RaycastFilterType.Include -- only include specified instances
+overlapParams.FilterDescendantsInstances = { container } -- only check simulation entities
 
 -- Define components
 local Part = Matter.component() -- create component to manage the visual Part
@@ -79,6 +191,15 @@ local function clampMag(v: Vector3, m: number)
 	return v
 end
 
+-- Clamp Vec2 magnitude to max number m (no strict typing due to metamethod operators)
+local function clampMag2(v, m: number)
+	local mag = v:magnitude()
+	if mag > m then
+		return v:unit() * m -- return clamped
+	end
+	return v
+end
+
 -- Random number between a and b
 local function rnd(a: number, b: number)
 	return a + math.random() * (b - a)
@@ -87,6 +208,18 @@ end
 -- Generate random spawn position within map bounds
 local function randomSpawnInMap()
 	return Vector3.new(rnd(-MAP_HALF, MAP_HALF), 2, rnd(-MAP_HALF, MAP_HALF))
+end
+
+-- Perform raycast to check line of sight between two positions
+local function hasLineOfSight(from: Vector3, to: Vector3): boolean
+	local direction = to - from -- calculate direction vector
+	local result = workspace:Raycast(from, direction, raycastParams) -- cast ray
+	return result == nil -- true if no obstacle hit (clear line of sight)
+end
+
+-- Get nearby parts using spatial query (more efficient than manual distance checks)
+local function getNearbyParts(position: Vector3, radius: number): { BasePart }
+	return workspace:GetPartBoundsInRadius(position, radius, overlapParams)
 end
 
 -- Create a visual part
@@ -126,7 +259,7 @@ local function spawnEntity(position: Vector3, component, color: Color3, size: Ve
 			position = position, -- start position
 		}),
 		Velocity({
-			value = Vector3.zero, -- start stationary
+			value = Vec2.new(0, 0), -- start stationary (using Vec2)
 		}),
 		Target({
 			value = nil, -- no target initially
@@ -232,23 +365,44 @@ local function regenEntity(world)
 end
 table.insert(systems, regenEntity) -- add the regenEntity system to the systems array
 
--- Find nearest target index (linear scan; fine for small sims)
+-- Find nearest target using spatial query and line-of-sight raycast
 local function findNearest(position: Vector3, world, component, radius: number): number?
 	local best, bestDistSq = nil, radius * radius
-	-- Find nearest
-	for id, _, health, transform in world:query(component, Health, Transform) do -- for each entity with the specified component, Health, and Transform
-		if health.value > 0 then
-			-- Calculate squared distance
-			local d = (transform.position - position)
-			local dsq = d.X * d.X + d.Z * d.Z -- ignore Y
-			-- Check if best
-			if dsq < bestDistSq then
-				-- New best
-				bestDistSq = dsq
-				best = id
+
+	-- Use spatial query to get nearby parts efficiently
+	local nearbyParts = getNearbyParts(position, radius)
+
+	-- Check each nearby part
+	for _, part in nearbyParts do
+		local entityId = part:GetAttribute("entityId") -- get entity ID from part attribute
+		if entityId and world:contains(entityId) then
+			-- Check if entity has the required component
+			if not world:get(entityId, component) then
+				continue -- skip if wrong type
+			end
+
+			local health = world:get(entityId, Health)
+			local transform = world:get(entityId, Transform)
+
+			if health and health.value > 0 and transform then
+				-- Calculate squared distance using Vec2 for efficiency
+				local myPos = Vec2.fromVector3(position)
+				local targetPos = Vec2.fromVector3(transform.position)
+				local offset = targetPos - myPos
+				local dsq = offset:sqrMagnitude() -- squared magnitude avoids sqrt
+
+				-- Check if closer than current best
+				if dsq < bestDistSq then
+					-- Raycast to check line of sight (physics-based visibility)
+					if hasLineOfSight(position, transform.position) then
+						bestDistSq = dsq
+						best = entityId
+					end
+				end
 			end
 		end
 	end
+
 	return best
 end
 
@@ -284,20 +438,21 @@ local function findTarget()
 end
 table.insert(systems, findTarget) -- add the findTarget system to the systems array
 
--- Separation steering
-local function separation(world, id, component): Vector3
-	local acc = Vector3.zero -- accumulated separation force
+-- Separation steering using Vec2 math
+local function separation(world, id, component): Vec2
+	local acc = Vec2.new(0, 0) -- accumulated separation force
 	local transform = world:get(id, Transform) -- get the Transform component of the entity with the given id
-	local myPos = transform.position -- get the position of the entity
+	local myPos = Vec2.fromVector3(transform.position) -- convert to Vec2
 
 	-- Check nearby same-type entities
 	for entityId, _, entityTransform in world:query(component, Transform) do -- for each entity with the specified component and Transform
 		if id ~= entityId then -- ignore self
-			-- Calculate offset
-			local offset = myPos - entityTransform.position
-			local dist = math.max(0.001, Vector3.new(offset.X, 0, offset.Z).Magnitude)
+			-- Calculate offset using Vec2
+			local entityPos = Vec2.fromVector3(entityTransform.position)
+			local offset = myPos - entityPos
+			local dist = math.max(0.001, offset:magnitude())
 			if dist < SEPARATION_RADIUS then -- Check if within separation radius
-				acc += (offset / dist) -- push away
+				acc = acc + (offset / dist) -- push away (using Vec2 operator overload)
 			end
 		end
 	end
@@ -306,84 +461,86 @@ local function separation(world, id, component): Vector3
 	return acc * SEPARATION_FORCE
 end
 
--- Keep inside square map (soft force)
-local function keepInBounds(transform): Vector3
-	-- Get position
-	local p = transform.position
+-- Keep inside square map (soft force) using Vec2
+local function keepInBounds(transform): Vec2
+	-- Get position as Vec2
+	local p = Vec2.fromVector3(transform.position)
 	-- Determine x and z force direction depending on position
 	local fx, fz = 0, 0
-	if p.X > MAP_HALF - BOUNDS_PADDING then -- Check if past the right edge
+	if p.x > MAP_HALF - BOUNDS_PADDING then -- Check if past the right edge
 		fx = fx - 1 -- apply leftward force
 	end
-	if p.X < -MAP_HALF + BOUNDS_PADDING then -- Check if past the left edge
+	if p.x < -MAP_HALF + BOUNDS_PADDING then -- Check if past the left edge
 		fx = fx + 1 -- apply rightward force
 	end
-	if p.Z > MAP_HALF - BOUNDS_PADDING then -- Check if past the top edge
+	if p.z > MAP_HALF - BOUNDS_PADDING then -- Check if past the top edge
 		fz = fz - 1 -- apply downward force
 	end
-	if p.Z < -MAP_HALF + BOUNDS_PADDING then -- Check if past the bottom edge
+	if p.z < -MAP_HALF + BOUNDS_PADDING then -- Check if past the bottom edge
 		fz = fz + 1 -- apply upward force
 	end
 	if fx == 0 and fz == 0 then
-		return Vector3.zero
+		return Vec2.new(0, 0)
 	end
-	-- Return force
-	return Vector3.new(fx, 0, fz).Unit * BOUNDS_FORCE
+	-- Return force using Vec2 unit and multiplication
+	return Vec2.new(fx, fz):unit() * BOUNDS_FORCE
 end
 
--- 3) Steering & movement (boids for consumers/hunters)
+-- 3) Steering & movement (boids for consumers/hunters) using Vec2
 local function moveEntity(world)
 	-- Get deltaTime
 	local deltaTime = Matter.useDeltaTime()
 
 	-- Update transform
 	for id, transform, velocity, target in world:query(Transform, Velocity, Target) do -- for each entity with Transform, Velocity, and Target components
-		-- Define force
-		local force = Vector3.zero
+		-- Define force as Vec2
+		local force = Vec2.new(0, 0)
 
 		-- Seek force
 		local targetId = target.value
 		if targetId and world:contains(targetId) then -- check if target is valid
 			-- Get target transform
 			local targetTransform = world:get(targetId, Transform)
-			-- Calculate desired velocity
-			local desired = (targetTransform.position - transform.position)
-			desired = Vector3.new(desired.X, 0, desired.Z)
-			if desired.Magnitude > 0 then
-				desired = desired.Unit * MAX_SPEED
-				local steer = desired - velocity.value
-				force += clampMag(steer, MAX_SPEED)
+			-- Calculate desired velocity using Vec2
+			local myPos = Vec2.fromVector3(transform.position)
+			local targetPos = Vec2.fromVector3(targetTransform.position)
+			local desired = targetPos - myPos -- Vec2 subtraction via metamethod
+			if desired:magnitude() > 0 then
+				desired = desired:unit() * MAX_SPEED -- normalize and scale
+				local steer = desired - velocity.value -- Vec2 subtraction
+				force = force + clampMag2(steer, MAX_SPEED)
 			end
 		end
 
 		-- Separation
 		if world:get(id, Carnivore) then -- check if entity is a carnivore
-			force += separation(world, id, Carnivore) -- apply separation force from other carnivores
+			force = force + separation(world, id, Carnivore) -- apply separation force from other carnivores
 		elseif world:get(id, Herbivore) then -- check if entity is a herbivore
-			force += separation(world, id, Herbivore) -- apply separation force from other herbivores
+			force = force + separation(world, id, Herbivore) -- apply separation force from other herbivores
 		else
 			-- Ignore any other kind of entities
 			continue
 		end
 
 		-- Keep in bounds
-		force += keepInBounds(transform)
+		force = force + keepInBounds(transform)
 
-		-- Integrate
-		local v = velocity.value + force * deltaTime
-		v = Vector3.new(v.X, 0, v.Z) -- keep Y zero
-		v = clampMag(v, MAX_SPEED) -- clamp to max speed
+		-- Integrate velocity using Vec2
+		local v = velocity.value + force * deltaTime -- Vec2 addition and scalar multiply
+		v = clampMag2(v, MAX_SPEED) -- clamp to max speed
 
 		-- Update velocity
 		velocity = velocity:patch({
-			value = v, -- new velocity
+			value = v, -- new velocity (Vec2)
 		})
 		world:insert(id, velocity) -- update velocity component
-		-- Update position
+
+		-- Update position (convert Vec2 velocity to Vector3 for position)
+		local displacement = v:toVector3(0) * deltaTime
 		world:insert(
 			id,
 			transform:patch({
-				position = transform.position + (v * deltaTime),
+				position = transform.position + displacement,
 			})
 		)
 	end
@@ -405,7 +562,13 @@ local function eatTarget(world)
 
 		-- Get enemy transform
 		local targetTransform, targetFood, targetPart = world:get(targetId, Transform, Food, Part) -- get target components by targetId
-		if (transform.position - targetTransform.position).Magnitude > EAT_RADIUS then
+
+		-- Calculate distance using Vec2 for XZ plane distance
+		local myPos = Vec2.fromVector3(transform.position)
+		local targetPos = Vec2.fromVector3(targetTransform.position)
+		local distance = (targetPos - myPos):magnitude()
+
+		if distance > EAT_RADIUS then
 			continue
 		end
 
@@ -432,12 +595,28 @@ local function eatTarget(world)
 end
 table.insert(systems, eatTarget) -- add the eatTarget system to the systems array
 
--- 5) Draw all parts
+-- 5) Draw all parts with CFrame rotation toward movement direction
 local function drawEntity(world)
-	-- Update all parts positions
+	-- Update all parts positions and rotations
 	for id, part, transform, velocity in world:query(Part, Transform, Velocity) do -- for each entity with Part, Transform, and Velocity components
-		-- Update part position
-		part.part.CFrame = CFrame.new(transform.position)
+		local pos = transform.position
+		local vel = velocity.value -- Vec2
+
+		-- Check if entity is moving (has velocity)
+		if vel:magnitude() > 0.1 then
+			-- Calculate look target position (current pos + velocity direction)
+			local lookTarget = pos + vel:toVector3(0)
+			-- Create target CFrame using CFrame.lookAt (faces movement direction)
+			local targetCFrame = CFrame.lookAt(pos, lookTarget)
+			-- Get current CFrame for smooth interpolation
+			local currentCFrame = part.part.CFrame
+			-- Lerp between current and target CFrame for smooth rotation
+			part.part.CFrame = currentCFrame:Lerp(targetCFrame, ROTATION_LERP_SPEED)
+		else
+			-- Not moving, just update position without rotation change
+			local currentRotation = part.part.CFrame - part.part.CFrame.Position -- extract rotation only
+			part.part.CFrame = currentRotation + pos -- apply rotation at new position
+		end
 	end
 end
 table.insert(systems, drawEntity) -- add the drawEntity system to the systems array
